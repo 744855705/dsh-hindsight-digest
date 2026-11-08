@@ -1,0 +1,40 @@
+{
+  "name": "dsh-hindsight-digest",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH plugin: append only the decision layer of each turn (user text, assistant text, ask exchanges) to a self-hosted Hindsight bank.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./digest": "./src/digest.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.2-rc.1"
+  },
+  "files": [
+    "index.js",
+    "src",
+    "bin",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "selftest": "node bin/selftest.js",
+    "check": "node --check index.js && node --check src/digest.js && node --check bin/selftest.js"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis-plugin",
+    "hindsight",
+    "memory"
+  ],
+  "license": "UNLICENSED"
+}

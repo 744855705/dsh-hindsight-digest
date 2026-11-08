@@ -1,0 +1,12 @@
+# dsh-hindsight-digest — one host-plane row.
+#
+# A `dsh.profile.bundles` entry only appends this file to the profile's ordered
+# patch list; the row below is what mounts the plugin. Disable it for one
+# profile without uninstalling by patching the id in the profile's own
+# cordis.patch.yml:
+#
+#   - id: hindsight-digest
+#     disabled: true
+- insert:
+    - id: hindsight-digest
+      name: "dsh-hindsight-digest"
