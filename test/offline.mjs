@@ -13,7 +13,7 @@
  * Exit code 0 = every check passed; 1 = at least one failed.
  */
 
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -61,6 +61,10 @@ function makeHome() {
     bankIdTemplate: "dsh::{gitProject}",
   }))
   return { home, cwd }
+}
+
+function readState(home) {
+  return JSON.parse(readFileSync(path.join(home, "hindsight-digest", "state.json"), "utf8"))
 }
 
 async function freshModule(home) {
@@ -365,6 +369,158 @@ await test("a subagent session is ignored", async () => {
   const events = [userEvent(0, "子智能体的任务"), assistantEvent(1, "子智能体的回答")]
   await mod.flush(fakeAgent({ id: "session-child", cwd, events, origin: "subagent" }))
   equal(calls.length, 0, "no write for a subagent")
+})
+
+// ---------------------------------------------------------------------------
+// batching
+// ---------------------------------------------------------------------------
+
+await test("flushIntervalMinutes defaults to 30 and clamps to the 1-minute floor", async () => {
+  const { home } = makeHome()
+  const mod = await freshModule(home)
+  const override = path.join(home, "hindsight-digest.json")
+  const base = JSON.parse(readFileSync(override, "utf8"))
+  equal(mod.resolveConfig().flushIntervalMinutes, 30, "default")
+  writeFileSync(override, JSON.stringify({ ...base, flushIntervalMinutes: 0.2 }))
+  equal(mod.resolveConfig().flushIntervalMinutes, 1, "below the floor is raised to it")
+  writeFileSync(override, JSON.stringify({ ...base, flushIntervalMinutes: "soon" }))
+  equal(mod.resolveConfig().flushIntervalMinutes, 30, "unparseable falls back to the default")
+  writeFileSync(override, JSON.stringify({ ...base, flushIntervalMinutes: 7 }))
+  equal(mod.resolveConfig().flushIntervalMinutes, 7, "an explicit value is honoured")
+})
+
+await test("two turns inside one interval become a single POST", async () => {
+  const { home, cwd } = makeHome()
+  const mod = await freshModule(home)
+  const events = [userEvent(0, "第一轮问题"), assistantEvent(1, "第一轮回答")]
+  const agent = fakeAgent({ id: "session-batch", cwd, events })
+  const calls = stubFetch(() => jsonResponse(200))
+
+  mod.markDirty(agent)
+  equal(calls.length, 0, "the turn boundary must not write")
+  const timer = mod.activeFlushTimer()
+  check(timer !== null, "a timer was scheduled")
+  equal(typeof timer.hasRef === "function" ? timer.hasRef() : false, false, "the timer must not hold the process open")
+
+  events.push(userEvent(2, "第二轮问题"), assistantEvent(3, "第二轮回答"))
+  mod.markDirty(agent)
+  equal(calls.length, 0, "the second boundary must not write either")
+
+  await mod.flushDirty()
+  equal(calls.length, 1, "exactly one POST for both turns")
+  const content = calls[0].body.items[0].content
+  check(content.includes("第一轮问题") && content.includes("第二轮问题"), "both turns in one document")
+  check(mod.activeFlushTimer() === null, "timer cleared once the set is empty")
+  equal(readState(home).sessions["session-batch"].seq, 3, "cursor covers both turns")
+  equal(readState(home).version, 2, "state version")
+})
+
+await test("agent/disposed writes immediately instead of waiting for the tick", async () => {
+  const { home, cwd } = makeHome()
+  const mod = await freshModule(home)
+  const handlers = new Map()
+  mod.apply({ on: (event, listener) => { handlers.set(event, listener) } })
+  const events = [userEvent(0, "会话要结束了"), assistantEvent(1, "回答")]
+  const agent = fakeAgent({ id: "session-disposed", cwd, events })
+  const calls = stubFetch(() => jsonResponse(200))
+
+  handlers.get("agent/turn-stopping")({ agent })
+  equal(calls.length, 0, "turn boundary wrote nothing")
+  check(mod.activeFlushTimer() !== null, "timer pending before disposal")
+
+  await handlers.get("agent/disposed")({ agent })
+  equal(calls.length, 1, "disposal wrote at once")
+  check(mod.activeFlushTimer() === null, "timer cleared with the dirty set")
+  equal(readState(home).sessions["session-disposed"].writes, 1, "one write recorded")
+})
+
+await test("a failed tick is replayed with the same operation_id", async () => {
+  const { home, cwd } = makeHome()
+  const mod = await freshModule(home)
+  const events = [userEvent(0, "会失败的问题"), assistantEvent(1, "会失败的回答")]
+  let attempt = 0
+  const calls = stubFetch(() => {
+    attempt += 1
+    if (attempt === 1) throw new Error("connection reset")
+    return jsonResponse(200)
+  })
+  const agent = fakeAgent({ id: "session-tick-retry", cwd, events })
+
+  mod.markDirty(agent)
+  await mod.flushDirty()
+  equal(calls.length, 1, "first tick attempted")
+  let state = readState(home)
+  equal(state.sessions["session-tick-retry"].seq, -1, "cursor held after the failure")
+  check(Boolean(state.sessions["session-tick-retry"].pending), "pending batch kept")
+
+  mod.markDirty(agent)
+  await mod.flushDirty()
+  equal(calls.length, 2, "second tick retried")
+  equal(calls[0].body.operation_id, calls[1].body.operation_id, "same operation_id on retry")
+  equal(calls[0].body.items[0].content, calls[1].body.items[0].content, "same content on retry")
+  state = readState(home)
+  equal(state.sessions["session-tick-retry"].seq, 1, "cursor advanced after success")
+  equal(state.sessions["session-tick-retry"].writes, 1, "one write recorded")
+})
+
+await test("a cursor left behind by an earlier exit flushes the backlog in one POST", async () => {
+  const { home, cwd } = makeHome()
+  mkdirSync(path.join(home, "hindsight-digest"), { recursive: true })
+  writeFileSync(path.join(home, "hindsight-digest", "state.json"), JSON.stringify({
+    version: 1,
+    sessions: { "session-backlog": { seq: -1, createdAt: "2026-11-08T00:00:00.000Z", writes: 0 } },
+  }))
+  const mod = await freshModule(home)
+  const events = [
+    userEvent(0, "积压的第一轮"),
+    assistantEvent(1, "第一答"),
+    userEvent(2, "积压的第二轮"),
+    assistantEvent(3, "第二答"),
+  ]
+  const calls = stubFetch(() => jsonResponse(200))
+  mod.markDirty(fakeAgent({ id: "session-backlog", cwd, events }))
+  await mod.flushDirty()
+  equal(calls.length, 1, "one POST carries the whole backlog")
+  const content = calls[0].body.items[0].content
+  check(content.includes("积压的第一轮") && content.includes("积压的第二轮"), "both backlogged turns present")
+  const state = readState(home)
+  equal(state.version, 2, "a v1 state is read and rewritten as v2")
+  equal(state.sessions["session-backlog"].seq, 3, "cursor covers the backlog")
+})
+
+await test("a tick over a tool-only stretch costs no request", async () => {
+  const { home, cwd } = makeHome()
+  const mod = await freshModule(home)
+  const events = [userEvent(0, "第一问"), assistantEvent(1, "第一答")]
+  const agent = fakeAgent({ id: "session-tick-tools", cwd, events })
+  const calls = stubFetch(() => jsonResponse(200))
+
+  mod.markDirty(agent)
+  await mod.flushDirty()
+  equal(calls.length, 1, "the first tick wrote")
+
+  events.push(
+    { type: "tool/call", seq: 2, time: BOOT + 2000, data: { name: "bash", callId: "c3", arguments: "{}" } },
+    { type: "tool/result", seq: 3, time: BOOT + 2000, data: { message: { source: { callId: "c3" }, content: [{ type: "text", text: "noise" }] } } },
+    assistantEvent(4, "只有工具", BOOT + 2000),
+  )
+  mod.markDirty(agent)
+  await mod.flushDirty()
+  equal(calls.length, 1, "no request for a user-less stretch")
+  equal(readState(home).sessions["session-tick-tools"].seq, 4, "cursor still advanced")
+})
+
+await test("a tick still drops the ask answered by typing the receipt", async () => {
+  const { home, cwd } = makeHome()
+  const mod = await freshModule(home)
+  const events = [userEvent(0, "把这段视频截一下"), askCall(1, "call-auth2", "①目标环境…②动作…③回滚…④回执…"),
+    askResult(2, "call-auth2", [{ id: "q1", selected: [], custom: "执行" }])]
+  const calls = stubFetch(() => jsonResponse(200))
+  mod.markDirty(fakeAgent({ id: "session-tick-receipt", cwd, events }))
+  await mod.flushDirty()
+  const content = calls[0].body.items[0].content
+  check(!content.includes("## 问答"), "authorisation ask must not enter memory")
+  check(content.includes("把这段视频截一下"), "the real request is kept")
 })
 
 // ---------------------------------------------------------------------------

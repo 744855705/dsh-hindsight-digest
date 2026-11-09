@@ -88,8 +88,9 @@ says so once.
 
 ## Behaviour
 
-* **Trigger** — `agent/turn-stopping` (a turn is about to close) and
-  `agent/disposed` (last chance before the session goes away).
+* **Trigger** — `agent/turn-stopping` only marks the session dirty;
+  `agent/disposed` flushes that session immediately (last chance before it goes
+  away) and drops it from the dirty set.
 * **Incremental** — each session has a cursor; only `event.seq > cursor` is
   processed. A message inserted mid-turn has a larger seq and is therefore
   picked up by the same flush, never lost.
@@ -105,6 +106,27 @@ says so once.
   dedupe keeps the document single instead of appending the tail twice.
 * **Never throws** — every hook path catches; a throwing `turn-stopping`
   listener would end the turn with an error.
+
+## Write cadence (写入节奏)
+
+A turn boundary does not write. It marks the session dirty and starts one
+`setTimeout` for the whole process; when that fires, every dirty session is
+flushed once, and a timer restarts only if something is dirty again.
+
+* **Delay, not loss** — a write lands at most `flushIntervalMinutes` after the
+  turn that produced it. Nothing fresh is buffered in memory: the cursor has not
+  moved, so the events stay in the session log and the flush takes them. If DSH
+  exits before the tick, the next process writes the same events with the same
+  `operation_id`, so the server still dedupes to one document.
+* **`flushIntervalMinutes`** — default `30`, floor `1`; set it in
+  `~/.dsh/hindsight-digest.json` (`{"flushIntervalMinutes": 10}`). A value below
+  the floor is raised to it; a non-numeric value falls back to the default.
+* **Why** — every POST makes the server run `retain_extract_facts`, and that LLM
+  call re-pays the same long system prefix each time. Measured over one hour of
+  per-turn writing: 30 retains, 94k input tokens, 73k of them that same prefix.
+  One POST per interval pays it once — roughly 70% fewer input tokens at 30 min.
+* **`agent/disposed`** still flushes immediately, so closing a session never
+  waits for a tick.
 
 Write request:
 
