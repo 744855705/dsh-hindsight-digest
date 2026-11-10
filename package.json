@@ -1,6 +1,6 @@
 {
   "name": "dsh-hindsight-digest",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "DSH plugin: append only the decision layer of each turn (user text, assistant text, ask exchanges) to a self-hosted Hindsight bank.",
   "type": "module",

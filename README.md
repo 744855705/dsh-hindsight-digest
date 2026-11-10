@@ -88,9 +88,8 @@ says so once.
 
 ## Behaviour
 
-* **Trigger** — `agent/turn-stopping` only marks the session dirty;
-  `agent/disposed` flushes that session immediately (last chance before it goes
-  away) and drops it from the dirty set.
+* **Trigger** — `agent/turn-stopping` writes immediately; `agent/disposed`
+  flushes whatever is left before the session goes away.
 * **Incremental** — each session has a cursor; only `event.seq > cursor` is
   processed. A message inserted mid-turn has a larger seq and is therefore
   picked up by the same flush, never lost.
@@ -107,26 +106,26 @@ says so once.
 * **Never throws** — every hook path catches; a throwing `turn-stopping`
   listener would end the turn with an error.
 
-## Write cadence (写入节奏)
+## Write timing (写入时机)
 
-A turn boundary does not write. It marks the session dirty and starts one
-`setTimeout` for the whole process; when that fires, every dirty session is
-flushed once, and a timer restarts only if something is dirty again.
+Every turn boundary writes. The request is one `POST` with `async: true`: the
+server stores the text and answers in milliseconds, and only the fact extraction
+runs in the background (`retain_extract_facts`, a few seconds).
 
-* **Delay, not loss** — a write lands at most `flushIntervalMinutes` after the
-  turn that produced it. Nothing fresh is buffered in memory: the cursor has not
-  moved, so the events stay in the session log and the flush takes them. If DSH
-  exits before the tick, the next process writes the same events with the same
-  `operation_id`, so the server still dedupes to one document.
-* **`flushIntervalMinutes`** — default `30`, floor `1`; set it in
-  `~/.dsh/hindsight-digest.json` (`{"flushIntervalMinutes": 10}`). A value below
-  the floor is raised to it; a non-numeric value falls back to the default.
-* **Why** — every POST makes the server run `retain_extract_facts`, and that LLM
-  call re-pays the same long system prefix each time. Measured over one hour of
-  per-turn writing: 30 retains, 94k input tokens, 73k of them that same prefix.
-  One POST per interval pays it once — roughly 70% fewer input tokens at 30 min.
-* **`agent/disposed`** still flushes immediately, so closing a session never
-  waits for a tick.
+* **Why not batch** — 0.2.0 held writes for 30 minutes to pay one extraction call
+  per interval instead of one per turn. That put the text in process memory:
+  closing or killing the client lost the whole interval. The server has no
+  "extract later" switch (`async: false` only waits, it does not move the
+  extraction), so a delay can only live on the client, where it costs
+  durability. 0.3.0 writes at every boundary instead.
+* **Cost** — one extraction call per turn (deepseek: roughly 3–4K input,
+  1–1.5K output, 2–3 s of server time). Accepted as the price of not losing text.
+* **Concurrency** — a boundary that arrives while the same session is still
+  writing is owed a second pass: the running write sets `again`, and the loop
+  reads the cursor again as soon as it finishes. N turns produce at most N
+  requests; none is folded into another and lost.
+* **No timer, no interval** — `flushIntervalMinutes` is gone. A config file that
+  still sets it is read normally and the key is ignored with one warning.
 
 Write request:
 

@@ -1,14 +1,17 @@
 /**
  * dsh-hindsight-digest — host-plane Cordis plugin.
  *
- * A turn boundary only marks its session dirty. Every `flushIntervalMinutes`
- * (default 30) the timer takes each dirty session, extracts the events appended
- * since its cursor, keeps only the decision layer (user text, assistant text,
- * ask exchanges — see `src/digest.js`), appends that to one
- * `conversation:<sessionId>` document in a self-hosted Hindsight bank, and
- * advances the cursor only after the write succeeded. Batching matters because
- * every POST makes the server run `retain_extract_facts`, and that call pays the
- * same long system prefix each time; one POST per interval pays it once.
+ * At every turn boundary it takes the events appended since the session cursor,
+ * keeps only the decision layer (user text, assistant text, ask exchanges — see
+ * `src/digest.js`), appends that to one `conversation:<sessionId>` document in a
+ * self-hosted Hindsight bank, and advances the cursor only after the write
+ * succeeded.
+ *
+ * Writes are immediate on purpose. The server already returns as soon as the
+ * text is stored (`async: true`); only fact extraction runs in the background.
+ * A client-side delay would hold the text in process memory, where closing the
+ * app throws it away — so the durability of the write wins over saving one
+ * `retain_extract_facts` call per turn.
  *
  * Invariants that matter more than features:
  *   - a listener here MUST NOT throw: a throwing `agent/turn-stopping` listener
@@ -16,8 +19,8 @@
  *   - the cursor moves only after a 2xx; a failed write is retried with the
  *     SAME operation_id, so the server's dedupe keeps the document single.
  *   - a session that existed before this process started is never backfilled.
- *   - exiting before the timer fires loses nothing: the cursor has not moved, so
- *     the next process flushes the same events.
+ *   - a boundary that arrives while the same session is still writing is owed a
+ *     second pass; it is never folded into the in-flight write.
  */
 
 import { execFileSync } from "node:child_process"
@@ -39,8 +42,6 @@ const RETAIN_TAGS = ["source:conversation", "harness:dsh"]
 const REQUEST_TIMEOUT_MS = 5000
 const STATE_VERSION = 2
 const MAX_STATE_SESSIONS = 200
-const DEFAULT_FLUSH_INTERVAL_MINUTES = 30
-const MIN_FLUSH_INTERVAL_MINUTES = 1
 
 // ---------------------------------------------------------------------------
 // paths
@@ -107,14 +108,14 @@ function readJsonFile(file) {
 }
 
 /**
- * `flushIntervalMinutes`: a missing or unparseable value falls back to the
- * default; a real number below the floor is raised to it rather than silently
- * ignored, so `0.5` means "as often as allowed", not "thirty minutes".
+ * `flushIntervalMinutes` existed in 0.2.0 only. It is gone with the batching
+ * timer; a file that still carries it keeps working, with one warning.
  */
-function resolveIntervalMinutes(raw) {
-  const value = typeof raw === "number" ? raw : Number(raw)
-  if (!Number.isFinite(value)) return DEFAULT_FLUSH_INTERVAL_MINUTES
-  return Math.max(MIN_FLUSH_INTERVAL_MINUTES, value)
+let obsoleteIntervalWarned = false
+function noteObsoleteInterval(merged) {
+  if (obsoleteIntervalWarned || !("flushIntervalMinutes" in merged)) return
+  obsoleteIntervalWarned = true
+  logWarn("flushIntervalMinutes is no longer used (writes happen every turn); ignoring it")
 }
 
 /**
@@ -129,20 +130,14 @@ export function resolveConfig() {
   const shared = readJsonFile(sharedConfigFile()) ?? {}
   const override = readJsonFile(overrideConfigFile()) ?? {}
   const merged = { ...shared, ...override }
+  noteObsoleteInterval(merged)
   const apiUrl = typeof merged.apiUrl === "string" ? merged.apiUrl.trim().replace(/\/+$/, "") : ""
   const apiToken = typeof merged.apiToken === "string" ? merged.apiToken.trim() : ""
   const template = typeof merged.bankIdTemplate === "string" && merged.bankIdTemplate.trim()
     ? merged.bankIdTemplate.trim()
     : DEFAULT_BANK_TEMPLATE
   const fixedBank = typeof merged.bankId === "string" && merged.bankId.trim() ? merged.bankId.trim() : ""
-  return {
-    apiUrl,
-    apiToken,
-    template,
-    fixedBank,
-    disabled: merged.disabled === true,
-    flushIntervalMinutes: resolveIntervalMinutes(merged.flushIntervalMinutes),
-  }
+  return { apiUrl, apiToken, template, fixedBank, disabled: merged.disabled === true }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,88 +418,42 @@ export async function flushSession(agent) {
   saveState()
 }
 
+/**
+ * Per session: whether a flush pass is running and whether another is owed.
+ * Sharing one promise would fold the newer turn into the write already in
+ * flight and lose it — that write's cursor is fixed before the newer events
+ * exist, so the caller's turn would wait for some later event, or for disposal.
+ */
 const inFlight = new Map()
 
-/** Coalesce concurrent flushes of one session; never rejects. */
+/**
+ * Flush one session; never rejects. A boundary that arrives mid-write sets
+ * `again`, and the running pass reads the cursor again immediately instead of
+ * letting that turn wait.
+ */
 export function flush(agent) {
   const sessionId = agent?.session?.header?.id
   if (typeof sessionId !== "string" || !sessionId) return Promise.resolve()
   const running = inFlight.get(sessionId)
-  if (running) return running
-  const attempt = (async () => {
+  if (running) {
+    running.again = true
+    return running.promise
+  }
+  const entry = { again: false, promise: undefined }
+  entry.promise = (async () => {
     try {
-      await flushSession(agent)
+      do {
+        entry.again = false
+        await flushSession(agent)
+      } while (entry.again)
     } catch (error) {
       logError("flush", error, resolveConfig())
+    } finally {
+      inFlight.delete(sessionId)
     }
-  })().finally(() => inFlight.delete(sessionId))
-  inFlight.set(sessionId, attempt)
-  return attempt
-}
-
-// ---------------------------------------------------------------------------
-// batching — one timer for every dirty session
-// ---------------------------------------------------------------------------
-
-/** Sessions with unflushed turns. The agent is kept so the tick can read it. */
-const dirty = new Map()
-let flushTimer = null
-
-/** The live timer; exposed so a test can assert it exists and does not hold the process. */
-export function activeFlushTimer() {
-  return flushTimer
-}
-
-function clearFlushTimer() {
-  if (flushTimer === null) return
-  clearTimeout(flushTimer)
-  flushTimer = null
-}
-
-function ensureFlushTimer() {
-  if (flushTimer !== null || dirty.size === 0) return
-  const config = resolveConfig()
-  if (config.disabled || !config.apiUrl || !config.apiToken) return
-  flushTimer = setTimeout(() => {
-    flushTimer = null
-    // An unhandled rejection here would leave the host with a dangling timer.
-    flushDirty().catch((error) => logError("scheduled flush", error, config))
-  }, config.flushIntervalMinutes * 60_000)
-  // Never keep DSH alive just to write memory.
-  flushTimer.unref?.()
-}
-
-/** Mark a session as having turns the next tick must write. */
-export function markDirty(agent) {
-  const session = agent?.session
-  const sessionId = session?.header?.id
-  if (typeof sessionId !== "string" || !sessionId) return
-  // A subagent's turns are the parent's tool behaviour, not user conversation.
-  if (session.header.origin === "subagent") return
-  const config = resolveConfig()
-  if (config.disabled || !config.apiUrl || !config.apiToken) return
-  dirty.set(sessionId, agent)
-  ensureFlushTimer()
-}
-
-/**
- * Flush every dirty session once, then stop. A session marked while the loop
- * runs stays dirty and restarts the timer, so nothing is dropped between ticks.
- * `flush()` never rejects and coalesces with an in-flight write of the same
- * session, so a tick racing `agent/disposed` writes at most once.
- */
-export async function flushDirty() {
-  const pending = [...dirty.values()]
-  dirty.clear()
-  clearFlushTimer()
-  for (const agent of pending) {
-    try {
-      await flush(agent)
-    } catch (error) {
-      logError("scheduled flush", error, resolveConfig())
-    }
-  }
-  ensureFlushTimer()
+  })()
+  inFlight.set(sessionId, entry)
+  return entry.promise
 }
 
 // ---------------------------------------------------------------------------
@@ -520,11 +469,10 @@ export function apply(ctx) {
 
   // DSH 0.2.x offers no `agent/session-start` (older harness docs still name
   // it); the real edges are `agent/turn-stopping` below and `agent/disposed`.
-  ctx.on("agent/turn-stopping", ({ agent }) => {
-    // No request here: the write waits for the tick, and a receipt-only or
-    // tool-only stretch costs nothing when it arrives.
+  ctx.on("agent/turn-stopping", async ({ agent }) => {
+    // Immediate: the text must be on the server before the app can be closed.
     try {
-      markDirty(agent)
+      await flush(agent)
     } catch (error) {
       logError("turn-stopping", error, resolveConfig())
     }
@@ -532,11 +480,6 @@ export function apply(ctx) {
   ctx.on("agent/disposed", ({ agent }) => {
     // Last chance to capture the tail of a session that is going away. The
     // returned promise is ignored by the emit dispatch; a test awaits it.
-    const sessionId = agent?.session?.header?.id
-    if (typeof sessionId === "string") {
-      dirty.delete(sessionId)
-      if (dirty.size === 0) clearFlushTimer()
-    }
     return flush(agent).catch((error) => logError("disposed flush", error, resolveConfig()))
   })
 }
